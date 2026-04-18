@@ -1,0 +1,1638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Δ Delta Career Tracker</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin:0; background:#07111f; color:#dce8f5;
+      font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }
+    ::-webkit-scrollbar { width:5px; height:5px; }
+    ::-webkit-scrollbar-track { background:#0d1e35; }
+    ::-webkit-scrollbar-thumb { background:#c01230; border-radius:3px; }
+    textarea,input,select { color-scheme:dark; }
+    @keyframes fadeIn { from{opacity:0;transform:translateX(12px)} to{opacity:1;transform:translateX(0)} }
+    @keyframes spin { to{transform:rotate(360deg)} }
+    .panel-enter { animation:fadeIn .18s ease; }
+    .spin { animation:spin .8s linear infinite; display:inline-block; }
+    .overlay { position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:100;
+      display:flex;align-items:center;justify-content:center; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useEffect, useCallback, useRef } = React;
+
+/* ─── constants ──────────────────────────────────────────── */
+const DR = '#E31837'; // Delta Red
+
+const STATUS = {
+  new:        { label:'New',         color:'#475569' },
+  researching:{ label:'Researching', color:'#2563eb' },
+  drafting:   { label:'Drafting',    color:'#d97706' },
+  applied:    { label:'Applied',     color:'#059669' },
+  interview:  { label:'Interview',   color:'#7c3aed' },
+  offer:      { label:'Offer',       color:'#10b981' },
+  rejected:   { label:'Rejected',   color:'#dc2626' },
+  withdrawn:  { label:'Withdrawn',  color:'#374151' },
+};
+const MONTHS = ['January','February','March','April','May','June',
+                'July','August','September','October','November','December'];
+const DAYS   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+/* ─── helpers ────────────────────────────────────────────── */
+const uid      = () => Math.random().toString(36).slice(2,10);
+const dateStr  = d => d ? new Date(d).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}) : '—';
+const shortDt  = d => d ? new Date(d).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '';
+const wc       = s => s ? s.trim().split(/\s+/).filter(Boolean).length : 0;
+const scoreClr = s => s>=70?'#10b981':s>=40?'#f59e0b':'#ef4444';
+
+function computeScore(j) {
+  let s=0;
+  if ((j.jobDescription||'').trim().length>50) s+=10;
+  if ((j.resume||'').trim().length>50)         s+=20;
+  if ((j.coverLetter||'').trim().length>50)    s+=20;
+  const o=j.deltaObjective||{};
+  ['income','flightHours','seniority','foCredentials'].forEach(k=>{
+    if((o[k]||'').trim().length>20) s+=5;
+  });
+  if((j.notes||[]).length>0)      s+=10;
+  if(j.status&&j.status!=='new')  s+=5;
+  if(j.applicationDate)           s+=5;
+  if((j.keywords||'').trim().length>10) s+=10;
+  return Math.min(s,100);
+}
+
+function makeJob(o={}) {
+  return {
+    id:uid(), title:'', company:'Delta Air Lines', location:'', url:'',
+    payRate:'', jobType:'', jobDescription:'', responsibilities:'', requirements:'',
+    aiScore:0, aiReasoning:'', dateAdded:new Date().toISOString(),
+    status:'new', applicationDate:'', resume:'', coverLetter:'', keywords:'',
+    notes:[], deltaObjective:{income:'',flightHours:'',seniority:'',foCredentials:''},
+    activities:[{id:uid(),date:new Date().toISOString(),type:'created',desc:'Role added to tracker'}],
+    ...o,
+  };
+}
+
+function defaultSettings() {
+  return {
+    ollamaEndpoint: 'http://localhost:11434/api/generate',
+    ollamaModel: 'llama3',
+    apifyToken: 'MotpMsZwMC53GdrHFMwe5byze',
+    webhookUrl: '',
+    scoreThreshold: 80,
+    searchQueries: [
+      'Delta Air Lines Analytics New York',
+      'Delta Air Lines Strategy Remote',
+      'Delta Air Lines Revenue Management',
+    ],
+    jobSources: [
+      { id:uid(), name:'Delta Air Lines Careers', url:'https://careers.delta.com', type:'public',     username:'', notes:'' },
+      { id:uid(), name:'LinkedIn Jobs – Delta',   url:'https://linkedin.com/jobs/search/?keywords=Delta+Air+Lines+strategy+analytics', type:'public', username:'', notes:'' },
+      { id:uid(), name:'Aviation Job Net',        url:'https://www.aviationjobnet.com', type:'public', username:'', notes:'' },
+      { id:uid(), name:'Avjobs.com',              url:'https://www.avjobs.com',         type:'membership', username:'', notes:'Requires paid membership' },
+      { id:uid(), name:'FSCareers / AirlineApps', url:'https://www.airlineapps.com',   type:'membership', username:'', notes:'Pilot application platform' },
+      { id:uid(), name:'ALPA Job Board',          url:'https://www.alpa.org/resources/for-pilots/jobs', type:'public', username:'', notes:'' },
+    ],
+  };
+}
+
+/* ─── Ollama caller (browser → localhost) ────────────────── */
+async function callOllama(endpoint, model, systemPrompt, userPrompt) {
+  const resp = await fetch(endpoint, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ model, system:systemPrompt, prompt:userPrompt, stream:false }),
+  });
+  if (!resp.ok) throw new Error(`Ollama ${resp.status}`);
+  const data = await resp.json();
+  return (data.response||'').trim();
+}
+
+const FIT_SYSTEM = `You are an aviation career strategist specializing in the Delta Air Lines First Officer pathway.
+Given a job description, write a concise, specific 2-3 sentence analysis for the requested dimension.
+Be concrete — reference the actual role title, pay, or skills mentioned.
+Do NOT use generic filler. Output only the analysis text, no preamble.`;
+
+function fitPrompt(field, job) {
+  const desc = [job.jobDescription, job.responsibilities].filter(Boolean).join('\n').slice(0,2000);
+  const ctx = `Role: ${job.title||'Unknown'} | Company: ${job.company} | Pay: ${job.payRate||'undisclosed'} | Location: ${job.location||'unknown'}\n\nJob Info:\n${desc||'No description provided.'}`;
+  const dims = {
+    income:       'How does this specific role support income stability and financial runway for someone actively building toward the Delta FO seat? Reference the pay or role level.',
+    flightHours:  'How does this role build aviation systems knowledge, operational understanding, or credibility that complements flight-hours accumulation on the FO pathway?',
+    seniority:    'How does this role position the candidate inside Delta\'s internal network, seniority ecosystem, and pilot hiring pipeline?',
+    foCredentials:'What specific skills, credentials, or professional profile elements does this role add to a competitive Delta First Officer application?',
+  };
+  return `${ctx}\n\nAnalysis dimension: ${dims[field]}`;
+}
+
+/* ─── localStorage hook ──────────────────────────────────── */
+function useLS(key, init) {
+  const [v, set] = useState(()=>{
+    try{ const s=localStorage.getItem(key); return s?JSON.parse(s):init; }
+    catch{ return init; }
+  });
+  useEffect(()=>{ try{localStorage.setItem(key,JSON.stringify(v));}catch{} },[key,v]);
+  return [v, set];
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ROOT APP
+═══════════════════════════════════════════════════════════ */
+function App() {
+  const [jobs,     setJobs]     = useLS('dct_jobs_v3', []);
+  const [settings, setSettings] = useLS('dct_settings_v1', defaultSettings());
+  const [tab,      setTab]      = useState('dashboard');
+  const [selId,    setSel]      = useState(null);
+  const [dTab,     setDTab]     = useState('listing');
+  const [calMonth, setCalMonth] = useState(new Date());
+  const [showImport,   setShowImport]   = useState(false);
+  const [showScraper,  setShowScraper]  = useState(false);
+  const [showAdvisor,  setShowAdvisor]  = useState(false);
+
+  const sel = jobs.find(j=>j.id===selId)||null;
+
+  const update = useCallback((id,patch)=>
+    setJobs(p=>p.map(j=>j.id===id?{...j,...patch}:j)),[setJobs]);
+
+  const addActivity = useCallback((id,desc)=>
+    setJobs(p=>p.map(j=>j.id===id
+      ?{...j,activities:[...(j.activities||[]),{id:uid(),date:new Date().toISOString(),type:'update',desc}]}
+      :j)),[setJobs]);
+
+  const addJob = () => {
+    const j=makeJob();
+    setJobs(p=>[j,...p]);
+    setSel(j.id); setDTab('listing'); setTab('applications');
+  };
+
+  const duplicate = job => {
+    const j=makeJob({...job,id:uid(),title:job.title+' (copy)',
+      dateAdded:new Date().toISOString(),applicationDate:'',status:'new',
+      activities:[{id:uid(),date:new Date().toISOString(),type:'created',desc:'Duplicated from: '+job.title}]});
+    setJobs(p=>[j,...p]); setSel(j.id); setDTab('listing');
+  };
+
+  const remove = id => {
+    setJobs(p=>p.filter(j=>j.id!==id));
+    if(selId===id) setSel(null);
+  };
+
+  const addNote = useCallback((id,text)=>
+    setJobs(p=>p.map(j=>j.id===id
+      ?{...j,notes:[...(j.notes||[]),{id:uid(),date:new Date().toISOString(),content:text}]}
+      :j)),[setJobs]);
+
+  const delNote = useCallback((jid,nid)=>
+    setJobs(p=>p.map(j=>j.id===jid?{...j,notes:j.notes.filter(n=>n.id!==nid)}:j)),[setJobs]);
+
+  const importJobs = rawJson => {
+    try {
+      const arr = JSON.parse(rawJson);
+      const toAdd = (Array.isArray(arr)?arr:[arr]).map(item=>makeJob({
+        title:        item.title||item.jobTitle||'',
+        url:          item.url||item.applyLink||item.jobUrl||'',
+        location:     item.location||'',
+        aiScore:      Number(item.score||item.aiScore||0),
+        aiReasoning:  item.reasoning||item.aiReasoning||'',
+        jobDescription: item.description||item.jobDescription||'',
+        payRate:      item.salary||item.payRate||'',
+        dateAdded:    item.dateAdded||new Date().toISOString(),
+        activities:   [{id:uid(),date:new Date().toISOString(),type:'created',desc:'Imported from scraper'}],
+      }));
+      // deduplicate by url
+      const existingUrls = new Set(jobs.map(j=>j.url).filter(Boolean));
+      const fresh = toAdd.filter(j=>!j.url||!existingUrls.has(j.url));
+      setJobs(p=>[...fresh,...p]);
+      setShowImport(false);
+      return fresh.length;
+    } catch(e) { alert('Invalid JSON: '+e.message); return 0; }
+  };
+
+  const open = id => { setSel(id); setDTab('listing'); setTab('applications'); };
+
+  const navItems = [
+    ['dashboard','Dashboard'],['calendar','Calendar'],
+    ['applications','Applications'],['settings','⚙ Settings'],
+  ];
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100vh',overflow:'hidden'}}>
+      {/* Header */}
+      <header style={{background:'#0b1a2e',borderBottom:'1px solid #1a2f4a',
+        display:'flex',alignItems:'center',justifyContent:'space-between',
+        padding:'0 20px',height:'52px',flexShrink:0}}>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <div style={{width:30,height:30,borderRadius:6,background:DR,
+            display:'flex',alignItems:'center',justifyContent:'center',
+            fontWeight:900,color:'#fff',fontSize:16}}>Δ</div>
+          <span style={{fontWeight:700,color:'#fff',fontSize:14,letterSpacing:'.02em'}}>Delta Career Tracker</span>
+        </div>
+        <nav style={{display:'flex',gap:4}}>
+          {navItems.map(([id,lbl])=>(
+            <button key={id} onClick={()=>setTab(id)} style={{
+              padding:'5px 14px',borderRadius:6,border:'none',cursor:'pointer',fontSize:13,fontWeight:600,
+              background:tab===id?DR:'transparent',
+              color:tab===id?'#fff':'#8fa8c8',transition:'all .15s'}}>
+              {lbl}
+            </button>
+          ))}
+        </nav>
+        <div style={{display:'flex',gap:8}}>
+          <button onClick={()=>setShowScraper(true)} style={{
+            padding:'5px 14px',borderRadius:6,border:'1px solid #1a3555',cursor:'pointer',
+            background:'#071e38',color:'#34d399',fontWeight:700,fontSize:13,letterSpacing:'.01em'}}>
+            ▶ Run Scraper
+          </button>
+          <button onClick={()=>setShowImport(true)} style={{
+            padding:'5px 14px',borderRadius:6,border:'1px solid #1a2f4a',cursor:'pointer',
+            background:'#0f2040',color:'#8fa8c8',fontWeight:600,fontSize:13}}>
+            ↓ Import
+          </button>
+          <button onClick={addJob} style={{
+            padding:'5px 16px',borderRadius:6,border:'none',cursor:'pointer',
+            background:DR,color:'#fff',fontWeight:700,fontSize:13}}>
+            + Add Role
+          </button>
+        </div>
+      </header>
+
+      {/* Body */}
+      <div style={{display:'flex',flex:1,overflow:'hidden'}}>
+        <main style={{flex:1,overflowY:'auto',padding:'24px'}}>
+          {tab==='dashboard'    && <Dashboard jobs={jobs} onOpen={open} />}
+          {tab==='calendar'     && <CalendarView jobs={jobs} month={calMonth} setMonth={setCalMonth} onOpen={open} />}
+          {tab==='applications' && <AppList jobs={jobs} selId={selId} onSelect={id=>{setSel(id);setDTab('listing');}} onDelete={remove} />}
+          {tab==='settings'     && <SettingsView settings={settings} setSettings={setSettings} />}
+        </main>
+
+        {sel && (
+          <aside className="panel-enter" style={{
+            width:580,borderLeft:'1px solid #1a2f4a',background:'#0b1a2e',
+            display:'flex',flexDirection:'column',overflowY:'auto',flexShrink:0}}>
+            <DetailPanel
+              job={sel} dTab={dTab} setDTab={setDTab}
+              update={update} duplicate={duplicate}
+              addNote={addNote} delNote={delNote}
+              addActivity={addActivity}
+              settings={settings}
+              onClose={()=>setSel(null)}
+            />
+          </aside>
+        )}
+      </div>
+
+      {showImport   && <ImportModal  onImport={importJobs} onClose={()=>setShowImport(false)} />}
+      {showScraper  && <ScraperModal onImport={importJobs} onClose={()=>setShowScraper(false)}
+                          serverUrl='http://localhost:8765' />}
+
+      {/* Floating AI Advisor button */}
+      <button onClick={()=>setShowAdvisor(v=>!v)} title="Delta Career Advisor" style={{
+        position:'fixed',bottom:24,right:24,width:54,height:54,borderRadius:'50%',
+        background: showAdvisor ? '#1a2f4a' : DR,
+        border: showAdvisor ? '2px solid #E31837' : 'none',
+        color:'#fff',fontSize:22,cursor:'pointer',zIndex:200,
+        boxShadow:'0 4px 20px rgba(0,0,0,.5)',display:'flex',alignItems:'center',justifyContent:'center',
+        transition:'all .2s'}}>
+        {showAdvisor ? '✕' : '✈'}
+      </button>
+
+      {showAdvisor && (
+        <AdvisorPanel
+          jobs={jobs}
+          settings={settings}
+          onClose={()=>setShowAdvisor(false)}
+          onOpenJob={open}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   IMPORT MODAL
+═══════════════════════════════════════════════════════════ */
+function ImportModal({ onImport, onClose }) {
+  const [text, setText] = useState('');
+  const [count, setCount] = useState(null);
+  const fileRef = useRef();
+
+  const handleFile = e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => setText(ev.target.result);
+    reader.readAsText(file);
+  };
+
+  const doImport = () => {
+    if (!text.trim()) return;
+    const n = onImport(text);
+    if (n !== null && n >= 0) setCount(n);
+  };
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{
+        background:'#0b1a2e',border:'1px solid #1a2f4a',borderRadius:16,
+        padding:'28px',width:560,maxHeight:'80vh',overflowY:'auto'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:18}}>
+          <div>
+            <h2 style={{margin:0,color:'#fff',fontSize:18,fontWeight:800}}>Import Scraped Jobs</h2>
+            <p style={{margin:'4px 0 0',fontSize:12,color:'#4a6a8a'}}>
+              Paste JSON from delta_agent.py or upload <code style={{color:'#60a5fa'}}>delta_jobs_export.json</code>
+            </p>
+          </div>
+          <button onClick={onClose} style={{background:'transparent',border:'none',color:'#4a6a8a',cursor:'pointer',fontSize:20}}>✕</button>
+        </div>
+
+        {count !== null
+          ? <div style={{textAlign:'center',padding:'32px 0'}}>
+              <div style={{fontSize:40,marginBottom:8}}>✅</div>
+              <div style={{fontSize:18,fontWeight:700,color:'#34d399'}}>{count} new role{count!==1?'s':''} imported</div>
+              <div style={{fontSize:13,color:'#4a6a8a',marginTop:4}}>Duplicates (matching URL) were skipped</div>
+              <button onClick={onClose} style={{marginTop:20,padding:'8px 24px',borderRadius:8,border:'none',
+                background:DR,color:'#fff',fontWeight:700,cursor:'pointer',fontSize:14}}>Done</button>
+            </div>
+          : <>
+              <div style={{display:'flex',gap:10,marginBottom:12}}>
+                <button onClick={()=>fileRef.current.click()} style={{
+                  padding:'7px 16px',borderRadius:8,border:'1px solid #1a2f4a',
+                  background:'#0f2040',color:'#8fa8c8',cursor:'pointer',fontSize:13,fontWeight:600}}>
+                  📂 Choose File
+                </button>
+                <input ref={fileRef} type="file" accept=".json" style={{display:'none'}} onChange={handleFile} />
+                <span style={{fontSize:12,color:'#4a6a8a',alignSelf:'center'}}>or paste JSON below</span>
+              </div>
+              <textarea value={text} onChange={e=>setText(e.target.value)} rows={10}
+                placeholder={'[\n  {\n    "title": "Revenue Management Analyst",\n    "url": "https://careers.delta.com/...",\n    "description": "...",\n    "score": 88,\n    "reasoning": "...",\n    "salary": "$95,000"\n  }\n]'}
+                style={{width:'100%',padding:'12px',borderRadius:9,border:'1px solid #1a2f4a',
+                  background:'#071422',color:'#c8dcf0',fontSize:12,
+                  resize:'vertical',outline:'none',fontFamily:'ui-monospace,monospace'}} />
+              <div style={{display:'flex',gap:10,marginTop:12,justifyContent:'flex-end'}}>
+                <button onClick={onClose} style={{padding:'8px 20px',borderRadius:8,
+                  border:'1px solid #1a2f4a',background:'transparent',color:'#8fa8c8',cursor:'pointer',fontSize:13}}>
+                  Cancel
+                </button>
+                <button onClick={doImport} style={{padding:'8px 20px',borderRadius:8,
+                  border:'none',background:DR,color:'#fff',fontWeight:700,cursor:'pointer',fontSize:13}}>
+                  Import Jobs
+                </button>
+              </div>
+            </>}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SCRAPER MODAL — triggers delta_agent.py via local FastAPI
+═══════════════════════════════════════════════════════════ */
+function ScraperModal({ serverUrl, onImport, onClose }) {
+  const [phase,   setPhase]   = useState('idle');   // idle | checking | running | done | offline | error
+  const [output,  setOutput]  = useState([]);
+  const [result,  setResult]  = useState(null);
+  const [elapsed, setElapsed] = useState(0);
+  const timerRef = useRef(null);
+
+  // Check server on mount
+  useEffect(()=>{
+    setPhase('checking');
+    fetch(serverUrl+'/status',{signal:AbortSignal.timeout(3000)})
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.status==='running') setPhase('idle');
+        else setPhase('offline');
+      })
+      .catch(()=>setPhase('offline'));
+  },[]);
+
+  const runScraper = async () => {
+    setPhase('running');
+    setOutput(['⏳ Connecting to Delta Jobs server...']);
+    setElapsed(0);
+    timerRef.current = setInterval(()=>setElapsed(s=>s+1), 1000);
+
+    try {
+      setOutput(p=>[...p,'🔍 Running Apify scraper (this takes 1-3 minutes)...']);
+      const resp = await fetch(serverUrl+'/run-scraper', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        signal: AbortSignal.timeout(300_000), // 5-min timeout
+      });
+      clearInterval(timerRef.current);
+      const data = await resp.json();
+
+      if (data.status === 'already_running') {
+        setOutput(p=>[...p,'⚠️  Scraper is already running. Try again in a moment.']);
+        setPhase('error');
+        return;
+      }
+
+      // Parse output lines
+      const lines = (data.output||'').split('\n').filter(Boolean);
+      setOutput(lines.length ? lines : ['✓ Scraper completed with no output.']);
+      setResult(data);
+      setPhase('done');
+    } catch(e) {
+      clearInterval(timerRef.current);
+      setOutput(p=>[...p,'✗ Error: '+(e.message||String(e))]);
+      setPhase('error');
+    }
+  };
+
+  const autoImport = async () => {
+    try {
+      const resp = await fetch(serverUrl+'/jobs');
+      const arr  = await resp.json();
+      const json = JSON.stringify(arr);
+      const n    = onImport(json);
+      setResult(r=>({...r, imported: n}));
+    } catch(e) {
+      alert('Could not fetch jobs from server: '+e.message);
+    }
+  };
+
+  const fmtElapsed = s => `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{
+        background:'#0b1a2e',border:'1px solid #1a2f4a',borderRadius:16,
+        padding:'28px',width:600,maxHeight:'82vh',overflowY:'auto'}}>
+
+        {/* Header */}
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:20}}>
+          <div>
+            <h2 style={{margin:0,color:'#fff',fontSize:18,fontWeight:800}}>▶ Run Delta Scraper</h2>
+            <p style={{margin:'4px 0 0',fontSize:12,color:'#4a6a8a'}}>
+              Runs <code style={{color:'#60a5fa'}}>delta_agent.py</code> via local FastAPI server → scores with Ollama → exports JSON
+            </p>
+          </div>
+          <button onClick={onClose} style={{background:'transparent',border:'none',color:'#4a6a8a',cursor:'pointer',fontSize:20,lineHeight:1}}>✕</button>
+        </div>
+
+        {/* CHECKING */}
+        {phase==='checking' && (
+          <div style={{textAlign:'center',padding:'32px 0',color:'#4a6a8a'}}>
+            <div className="spin" style={{fontSize:28,display:'block',marginBottom:12}}>⟳</div>
+            Checking server status…
+          </div>
+        )}
+
+        {/* OFFLINE */}
+        {phase==='offline' && (
+          <div style={{background:'#1a0e0e',border:'1px solid #5a1a1a',borderRadius:10,padding:'20px'}}>
+            <div style={{color:'#f87171',fontWeight:700,fontSize:15,marginBottom:12}}>
+              ⚠️  FastAPI server not running at localhost:8765
+            </div>
+            <p style={{color:'#8fa8c8',fontSize:13,margin:'0 0 14px',lineHeight:1.6}}>
+              Run the one-time setup script to install the server and configure it to auto-start on login:
+            </p>
+            <div style={{background:'#071422',borderRadius:8,padding:'12px 14px',
+              fontFamily:'ui-monospace,monospace',fontSize:12,color:'#34d399',marginBottom:14}}>
+              cd ~/Downloads &amp;&amp; bash setup_delta_automation.sh
+            </div>
+            <p style={{color:'#4a6a8a',fontSize:12,margin:0,lineHeight:1.5}}>
+              After setup, the server starts automatically when you log in.
+              To start it right now without rebooting:<br/>
+              <code style={{color:'#60a5fa'}}>launchctl start com.rashida.delta-server</code>
+            </p>
+            <div style={{display:'flex',gap:10,marginTop:18,justifyContent:'flex-end'}}>
+              <button onClick={()=>{setPhase('checking');
+                  fetch(serverUrl+'/status',{signal:AbortSignal.timeout(3000)})
+                    .then(r=>r.json()).then(()=>setPhase('idle')).catch(()=>setPhase('offline'));}}
+                style={{padding:'7px 18px',borderRadius:8,border:'1px solid #1a2f4a',
+                  background:'#0f2040',color:'#8fa8c8',cursor:'pointer',fontSize:13,fontWeight:600}}>
+                🔄 Retry
+              </button>
+              <button onClick={onClose} style={{padding:'7px 18px',borderRadius:8,border:'none',
+                background:'#374151',color:'#fff',cursor:'pointer',fontSize:13,fontWeight:600}}>Close</button>
+            </div>
+          </div>
+        )}
+
+        {/* IDLE — ready to run */}
+        {phase==='idle' && (
+          <div>
+            <div style={{background:'#071e14',border:'1px solid #1a4a2a',borderRadius:10,
+              padding:'16px 20px',marginBottom:20,display:'flex',alignItems:'center',gap:12}}>
+              <span style={{fontSize:20}}>✅</span>
+              <div>
+                <div style={{color:'#34d399',fontWeight:700,fontSize:14}}>Server is live at localhost:8765</div>
+                <div style={{color:'#4a6a8a',fontSize:12,marginTop:2}}>Ready to scrape Delta job listings</div>
+              </div>
+            </div>
+            <p style={{color:'#8fa8c8',fontSize:13,margin:'0 0 20px',lineHeight:1.6}}>
+              This will run the full scraper pipeline: Apify search → Ollama scoring → deduplication → export.
+              Jobs scoring ≥80/100 will also fire your webhook. Takes 1–3 minutes.
+            </p>
+            <div style={{display:'flex',gap:10,justifyContent:'flex-end'}}>
+              <button onClick={onClose} style={{padding:'8px 20px',borderRadius:8,
+                border:'1px solid #1a2f4a',background:'transparent',color:'#8fa8c8',cursor:'pointer',fontSize:13}}>
+                Cancel
+              </button>
+              <button onClick={runScraper} style={{padding:'8px 24px',borderRadius:8,border:'none',
+                background:'#059669',color:'#fff',fontWeight:700,cursor:'pointer',fontSize:14}}>
+                ▶ Run Now
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* RUNNING */}
+        {phase==='running' && (
+          <div>
+            <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:16}}>
+              <span className="spin" style={{fontSize:20,color:'#34d399'}}>⟳</span>
+              <span style={{color:'#34d399',fontWeight:700,fontSize:14}}>Scraper running… {fmtElapsed(elapsed)}</span>
+            </div>
+            <div style={{background:'#030c18',borderRadius:8,padding:'12px',
+              fontFamily:'ui-monospace,monospace',fontSize:11,color:'#60a5fa',
+              maxHeight:280,overflowY:'auto',lineHeight:1.7,whiteSpace:'pre-wrap'}}>
+              {output.map((l,i)=><div key={i}>{l}</div>)}
+              <span className="spin" style={{display:'inline-block',fontSize:10,color:'#4a6a8a'}}>▮</span>
+            </div>
+          </div>
+        )}
+
+        {/* DONE */}
+        {phase==='done' && result && (
+          <div>
+            <div style={{background:'#071e14',border:'1px solid #1a4a2a',borderRadius:10,
+              padding:'16px 20px',marginBottom:16,display:'flex',alignItems:'center',gap:14}}>
+              <span style={{fontSize:28}}>✅</span>
+              <div>
+                <div style={{color:'#34d399',fontWeight:800,fontSize:15}}>
+                  Scraper complete — {result.jobsInExport} job{result.jobsInExport!==1?'s':''} in export
+                </div>
+                <div style={{color:'#4a6a8a',fontSize:12,marginTop:3}}>
+                  Ran in {fmtElapsed(elapsed)} · exit code {result.returnCode}
+                </div>
+              </div>
+            </div>
+
+            {/* Console output */}
+            <div style={{background:'#030c18',borderRadius:8,padding:'12px',
+              fontFamily:'ui-monospace,monospace',fontSize:11,color:'#94a3b8',
+              maxHeight:180,overflowY:'auto',lineHeight:1.7,whiteSpace:'pre-wrap',marginBottom:16}}>
+              {(result.output||'').trim()||'(no output)'}
+            </div>
+
+            {result.imported != null
+              ? <div style={{textAlign:'center',padding:'12px 0',color:'#34d399',fontWeight:700,fontSize:15}}>
+                  ✓ {result.imported} role{result.imported!==1?'s':''} imported into tracker
+                </div>
+              : <div style={{display:'flex',gap:10,justifyContent:'flex-end'}}>
+                  <button onClick={onClose} style={{padding:'8px 20px',borderRadius:8,
+                    border:'1px solid #1a2f4a',background:'transparent',color:'#8fa8c8',cursor:'pointer',fontSize:13}}>
+                    Close
+                  </button>
+                  <button onClick={autoImport} style={{padding:'8px 22px',borderRadius:8,border:'none',
+                    background:'#E31837',color:'#fff',fontWeight:700,cursor:'pointer',fontSize:14}}>
+                    ↓ Import {result.jobsInExport} Jobs Now
+                  </button>
+                </div>
+            }
+          </div>
+        )}
+
+        {/* ERROR */}
+        {phase==='error' && (
+          <div>
+            <div style={{background:'#030c18',borderRadius:8,padding:'12px',
+              fontFamily:'ui-monospace,monospace',fontSize:11,color:'#f87171',
+              maxHeight:240,overflowY:'auto',lineHeight:1.7,whiteSpace:'pre-wrap',marginBottom:16}}>
+              {output.map((l,i)=><div key={i}>{l}</div>)}
+            </div>
+            <div style={{display:'flex',gap:10,justifyContent:'flex-end'}}>
+              <button onClick={onClose} style={{padding:'8px 20px',borderRadius:8,
+                border:'1px solid #1a2f4a',background:'transparent',color:'#8fa8c8',cursor:'pointer',fontSize:13}}>
+                Close
+              </button>
+              <button onClick={()=>{setPhase('idle');setOutput([]);setElapsed(0);}}
+                style={{padding:'8px 20px',borderRadius:8,border:'none',
+                  background:'#374151',color:'#fff',fontWeight:600,cursor:'pointer',fontSize:13}}>
+                Try Again
+              </button>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   AI DELTA CAREER ADVISOR
+   Floating chat panel — proactive Delta Captain / DPE pathway coach
+   powered by local Ollama, with full job pipeline context
+═══════════════════════════════════════════════════════════ */
+const ADVISOR_SYSTEM = `You are Captain Advisor — an elite Delta Air Lines career strategist and former Delta Check Airman with deep knowledge of:
+
+DELTA CAPTAIN PATHWAY:
+- Regional airline → Major airline FO pipeline (most common: SkyWest, Endeavor, GoJet → Delta mainline)
+- Minimum ATP requirements: 1,500 hours total time, 500 multi-engine, 250 cross-country, ATP CTP course
+- Delta new-hire FO minimums: ATP certificate, 1,500+ TT, strong jet/turbine time preferred
+- Delta CAMP (Career Advancement Mentoring Program) and Delta Connection carriers as feeders
+- Seniority number: everything at Delta runs by date-of-hire seniority — earlier hire = faster upgrade
+- Upgrade to Captain timeline: currently 5-10 years depending on base/equipment bid
+- Base domiciles: ATL, JFK, LAX, SEA, BOS, DTW, MSP, SLC, LGA — ATL has fastest upgrade historically
+
+DPE (DESIGNATED PILOT EXAMINER) PATHWAY:
+- DPE appointed by FAA FSDO — must be active CFI/CFII/MEI with extensive examiner experience
+- Typical path: CFI → CFII → MEI → conduct hundreds of checkrides as safety pilot/observer → apply to FSDO
+- DPE credential adds significant income ($700-1,500+ per checkride) and industry credibility
+- DPE status enhances Delta FO application — shows examiner-level proficiency
+- Can be pursued in parallel while building hours at regional carrier
+
+ACCELERATED STRATEGIES:
+1. Corporate/fractional flying (NetJets, Flexjet, XOJET) — faster hours but less seniority credit
+2. Military pathway — fastest to ATP hours, direct pipeline programs (Delta Propel, etc.)
+3. Instructor route — CFI/CFII at busy flight school (1,200-1,500 hours in 18-24 months possible)
+4. Regional carrier: Endeavor Air (Delta wholly-owned subsidiary) is THE direct feeder — highest priority
+5. Delta Propel program — cadet pathway, conditional job offer before you start flight training
+
+KEY CERTIFICATIONS TIMELINE:
+PPL → Instrument → Commercial → CFI → CFII → MEI → ATP CTP → ATP
+
+INCOME STRATEGY:
+- During hour-building: maximize pay at regional ($60-120K FO at major regionals now)
+- At Delta mainline FO: $120-250K+ depending on equipment and seniority
+- Delta Captain: $250-400K+ total compensation
+- Side income: CFI, DPE checkrides, simulator instruction
+
+CURRENT MARKET (2026):
+- Major airlines still hiring aggressively post-COVID
+- Regional pilot shortage = faster upgrades to Captain at regionals
+- Delta mainline hiring has slowed slightly but Endeavor Air still actively hiring
+- ATP-CTP and ATP written are prerequisites — get these done early
+
+When analyzing jobs, always consider: does this role build hours? Add seniority? Provide income runway?
+Connect to Delta's internal pipeline? Add DPE-relevant credentials?
+Always be specific, actionable, and proactive. Reference the user's actual job pipeline data provided.`;
+
+function buildAdvisorContext(jobs) {
+  if (!jobs.length) return 'No jobs in tracker yet.';
+  const summary = jobs.slice(0, 20).map(j => {
+    const score = computeScore(j);
+    const aiS = j.aiScore || 0;
+    return `- "${j.title}" @ ${j.company||'Unknown'} | Status: ${j.status} | Fit: ${aiS}/100 | Optimization: ${score}% | Pay: ${j.payRate||'unknown'} | ${j.location||''}`;
+  }).join('\n');
+  const counts = {
+    total: jobs.length,
+    applied: jobs.filter(j=>['applied','interview','offer'].includes(j.status)).length,
+    highFit: jobs.filter(j=>j.aiScore>=80).length,
+    avgFit: jobs.length ? Math.round(jobs.reduce((s,j)=>s+(j.aiScore||0),0)/jobs.length) : 0,
+  };
+  return `PIPELINE SUMMARY: ${counts.total} total jobs | ${counts.applied} applied | ${counts.highFit} high-fit (≥80) | avg fit score ${counts.avgFit}/100\n\nJOBS:\n${summary}`;
+}
+
+const QUICK_PROMPTS = [
+  { label: '🎯 What should I apply to first?', prompt: 'Looking at my current pipeline, which specific role should I prioritize applying to first and why? Be specific about which job title and give me an action plan.' },
+  { label: '✈️ Fastest path to Delta FO?', prompt: 'Given my current job pipeline and the Delta FO pathway, what is the single fastest route I can take right now to get a Delta mainline First Officer seat? What specific steps should I take in the next 90 days?' },
+  { label: '📋 DPE credentials roadmap', prompt: 'Give me a detailed, month-by-month roadmap to achieve DPE (Designated Pilot Examiner) credentials while I am simultaneously building hours toward Delta. What certifications do I need first, and which jobs in my pipeline best support this?' },
+  { label: '🔍 Pipeline gaps', prompt: 'Analyze my job pipeline and tell me exactly what is missing. What types of roles should I be targeting that I am NOT currently tracking? Be specific about role types, companies, and why they matter for the Delta Captain pathway.' },
+  { label: '💰 Income runway strategy', prompt: 'What is the optimal income strategy to sustain myself financially while building flight hours? Which jobs in my pipeline pay best AND build the most relevant hours? Give me a 2-year financial runway plan.' },
+  { label: '🏆 Endeavor Air strategy', prompt: 'Endeavor Air is Delta\'s wholly-owned regional carrier and the most direct feeder to mainline. How should I position myself to get hired at Endeavor Air, and how long realistically until I could upgrade to Delta mainline from there?' },
+];
+
+function AdvisorPanel({ jobs, settings, onClose, onOpenJob }) {
+  const [messages, setMessages] = useState([{
+    role: 'assistant',
+    text: `Hello! I'm Captain Advisor — your dedicated Delta Air Lines career strategist. I have full visibility into your job pipeline (${jobs.length} role${jobs.length!==1?'s':''} tracked).\n\nI can proactively identify which opportunities will accelerate your Delta Captain pathway, map your route to DPE credentials, and help you prioritize every application decision.\n\nWhat would you like to work on?`,
+    ts: Date.now(),
+  }]);
+  const [input, setInput]     = useState('');
+  const [thinking, setThink]  = useState(false);
+  const bottomRef = useRef();
+  const inputRef  = useRef();
+
+  const endpoint = (settings||{}).ollamaEndpoint || 'http://localhost:11434/api/generate';
+  const model    = (settings||{}).ollamaModel    || 'llama3';
+
+  useEffect(()=>{
+    bottomRef.current?.scrollIntoView({behavior:'smooth'});
+  },[messages, thinking]);
+
+  const send = async (text) => {
+    if (!text.trim() || thinking) return;
+    const userMsg = { role:'user', text: text.trim(), ts: Date.now() };
+    setMessages(p=>[...p, userMsg]);
+    setInput('');
+    setThink(true);
+
+    // Build full conversation context
+    const jobContext = buildAdvisorContext(jobs);
+    const history = messages.slice(-6).map(m=>`${m.role==='user'?'User':'Advisor'}: ${m.text}`).join('\n\n');
+    const fullPrompt = `${history ? history+'\n\n' : ''}User: ${text.trim()}\n\n[Current Pipeline Context]\n${jobContext}`;
+
+    try {
+      const resp = await callOllama(endpoint, model, ADVISOR_SYSTEM, fullPrompt);
+      setMessages(p=>[...p, { role:'assistant', text: resp, ts: Date.now() }]);
+    } catch(e) {
+      setMessages(p=>[...p, {
+        role:'assistant',
+        text: `⚠️ Could not reach Ollama at ${endpoint}. Make sure Ollama is running:\n\`ollama serve\`\nthen pull the model:\n\`ollama pull ${model}\``,
+        ts: Date.now(),
+      }]);
+    }
+    setThink(false);
+    setTimeout(()=>inputRef.current?.focus(), 50);
+  };
+
+  const handleKey = e => {
+    if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); send(input); }
+  };
+
+  return (
+    <div style={{
+      position:'fixed', bottom:90, right:24, width:420, height:600,
+      background:'#0b1a2e', border:'1px solid #1a2f4a', borderRadius:16,
+      display:'flex', flexDirection:'column', zIndex:199,
+      boxShadow:'0 8px 40px rgba(0,0,0,.7)', overflow:'hidden',
+    }}>
+      {/* Header */}
+      <div style={{background:'#071422', borderBottom:'1px solid #1a2f4a',
+        padding:'12px 16px', display:'flex', alignItems:'center', gap:10, flexShrink:0}}>
+        <div style={{width:32,height:32,borderRadius:'50%',background:DR,
+          display:'flex',alignItems:'center',justifyContent:'center',fontSize:16,fontWeight:900,color:'#fff'}}>
+          ✈
+        </div>
+        <div style={{flex:1}}>
+          <div style={{color:'#fff',fontWeight:700,fontSize:14,lineHeight:1}}>Captain Advisor</div>
+          <div style={{color:'#34d399',fontSize:11,marginTop:2}}>Delta Career AI · {jobs.length} roles in pipeline</div>
+        </div>
+        <button onClick={onClose} style={{background:'transparent',border:'none',color:'#4a6a8a',cursor:'pointer',fontSize:18,lineHeight:1}}>✕</button>
+      </div>
+
+      {/* Messages */}
+      <div style={{flex:1, overflowY:'auto', padding:'14px 16px', display:'flex', flexDirection:'column', gap:10}}>
+        {messages.map((m,i)=>(
+          <div key={i} style={{display:'flex', flexDirection:'column',
+            alignItems: m.role==='user'?'flex-end':'flex-start'}}>
+            <div style={{
+              maxWidth:'88%', padding:'10px 13px', borderRadius:12,
+              background: m.role==='user' ? DR : '#0f2040',
+              color: '#dce8f5', fontSize:13, lineHeight:1.6,
+              whiteSpace:'pre-wrap', wordBreak:'break-word',
+              borderBottomRightRadius: m.role==='user'?2:12,
+              borderBottomLeftRadius:  m.role==='user'?12:2,
+            }}>
+              {m.text}
+            </div>
+          </div>
+        ))}
+        {thinking && (
+          <div style={{display:'flex',alignItems:'center',gap:8,color:'#4a6a8a',fontSize:12}}>
+            <span className="spin" style={{fontSize:14}}>⟳</span> Captain Advisor is thinking…
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* Quick prompts */}
+      <div style={{padding:'8px 12px', borderTop:'1px solid #0f2040', display:'flex', gap:6,
+        overflowX:'auto', flexShrink:0}}>
+        {QUICK_PROMPTS.map((q,i)=>(
+          <button key={i} onClick={()=>send(q.prompt)} disabled={thinking}
+            style={{
+              flexShrink:0, padding:'4px 10px', borderRadius:20,
+              border:'1px solid #1a3555', background:'#071422',
+              color:'#60a5fa', fontSize:11, cursor:'pointer', whiteSpace:'nowrap',
+              opacity: thinking?0.5:1,
+            }}>
+            {q.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Input */}
+      <div style={{padding:'10px 12px', borderTop:'1px solid #1a2f4a', display:'flex', gap:8, flexShrink:0}}>
+        <textarea
+          ref={inputRef}
+          value={input}
+          onChange={e=>setInput(e.target.value)}
+          onKeyDown={handleKey}
+          disabled={thinking}
+          placeholder="Ask about your Delta pathway, DPE timeline, which jobs to prioritize…"
+          rows={2}
+          style={{
+            flex:1, padding:'8px 10px', borderRadius:8, border:'1px solid #1a3555',
+            background:'#071422', color:'#dce8f5', fontSize:12, resize:'none',
+            outline:'none', lineHeight:1.5, fontFamily:'inherit',
+          }}
+        />
+        <button onClick={()=>send(input)} disabled={thinking||!input.trim()} style={{
+          padding:'0 14px', borderRadius:8, border:'none',
+          background: (!thinking&&input.trim()) ? DR : '#1a2f4a',
+          color:'#fff', cursor: (!thinking&&input.trim())?'pointer':'default',
+          fontSize:16, flexShrink:0, transition:'background .15s',
+        }}>↑</button>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   DASHBOARD
+═══════════════════════════════════════════════════════════ */
+function Dashboard({ jobs, onOpen }) {
+  const total   = jobs.length;
+  const applied = jobs.filter(j=>['applied','interview','offer'].includes(j.status)).length;
+  const inProg  = jobs.filter(j=>['researching','drafting'].includes(j.status)).length;
+  const avgSc   = total ? Math.round(jobs.reduce((s,j)=>s+computeScore(j),0)/total) : 0;
+  const recent  = [...jobs].sort((a,b)=>new Date(b.dateAdded)-new Date(a.dateAdded)).slice(0,6);
+  const upcoming= jobs.filter(j=>j.applicationDate&&new Date(j.applicationDate)>new Date())
+                      .sort((a,b)=>new Date(a.applicationDate)-new Date(b.applicationDate)).slice(0,5);
+
+  const Card=({label,value,color})=>(
+    <div style={{background:'#0f2040',border:'1px solid #1a2f4a',borderRadius:12,padding:'18px 20px'}}>
+      <div style={{fontSize:32,fontWeight:800,color}}>{value}</div>
+      <div style={{fontSize:12,color:'#6b8aaa',marginTop:4,fontWeight:500}}>{label}</div>
+    </div>
+  );
+
+  return (
+    <div style={{maxWidth:880,margin:'0 auto'}}>
+      <h1 style={{fontSize:22,fontWeight:800,color:'#fff',marginBottom:20}}>Dashboard</h1>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:14,marginBottom:20}}>
+        <Card label="Total Roles"  value={total}    color='#60a5fa' />
+        <Card label="Applied"      value={applied}  color='#34d399' />
+        <Card label="In Progress"  value={inProg}   color='#fbbf24' />
+        <Card label="Avg Opt Score" value={avgSc+'%'} color={scoreClr(avgSc)} />
+      </div>
+
+      {/* Pipeline */}
+      <div style={{background:'#0f2040',border:'1px solid #1a2f4a',borderRadius:12,padding:'18px 20px',marginBottom:20}}>
+        <div style={{fontSize:11,fontWeight:700,color:'#6b8aaa',letterSpacing:'.08em',marginBottom:12}}>PIPELINE</div>
+        <div style={{display:'flex',flexWrap:'wrap',gap:8}}>
+          {Object.entries(STATUS).map(([s,{label,color}])=>{
+            const cnt=jobs.filter(j=>j.status===s).length;
+            if(!cnt) return null;
+            return <span key={s} style={{background:color+'22',border:`1px solid ${color}55`,
+              color,borderRadius:20,padding:'3px 12px',fontSize:12,fontWeight:600}}>{label}: {cnt}</span>;
+          })}
+          {!total && <span style={{fontSize:13,color:'#4a6a8a'}}>No roles yet — click + Add Role to start</span>}
+        </div>
+      </div>
+
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14}}>
+        {[
+          {title:'RECENTLY ADDED', items:recent, key:'dateAdded', color:'#4a6a8a'},
+          {title:'UPCOMING DEADLINES', items:upcoming, key:'applicationDate', color:'#fbbf24'},
+        ].map(({title,items,key,color})=>(
+          <div key={title} style={{background:'#0f2040',border:'1px solid #1a2f4a',borderRadius:12,padding:'18px 20px'}}>
+            <div style={{fontSize:11,fontWeight:700,color:'#6b8aaa',letterSpacing:'.08em',marginBottom:12}}>{title}</div>
+            {items.map(j=>(
+              <button key={j.id} onClick={()=>onOpen(j.id)} style={{
+                display:'flex',justifyContent:'space-between',alignItems:'center',
+                width:'100%',padding:'7px 8px',borderRadius:7,border:'none',
+                background:'transparent',cursor:'pointer',textAlign:'left',transition:'background .12s'}}
+                onMouseOver={e=>e.currentTarget.style.background='#162a46'}
+                onMouseOut={e=>e.currentTarget.style.background='transparent'}>
+                <span style={{fontSize:13,color:'#c8dcf0',flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{j.title||'Untitled'}</span>
+                <span style={{fontSize:11,color,marginLeft:8,flexShrink:0}}>{shortDt(j[key])}</span>
+              </button>
+            ))}
+            {!items.length && <p style={{fontSize:13,color:'#4a6a8a',margin:0}}>None yet</p>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CALENDAR
+═══════════════════════════════════════════════════════════ */
+function CalendarView({ jobs, month, setMonth, onOpen }) {
+  const yr=month.getFullYear(), mo=month.getMonth();
+  const first=new Date(yr,mo,1).getDay(), days=new Date(yr,mo+1,0).getDate();
+  const todayStr=new Date().toDateString();
+
+  const byDate={};
+  jobs.forEach(j=>{
+    [j.applicationDate,j.dateAdded].filter(Boolean).forEach(d=>{
+      const k=new Date(d).toDateString();
+      if(!byDate[k]) byDate[k]=new Set();
+      byDate[k].add(j);
+    });
+  });
+
+  return (
+    <div style={{maxWidth:900,margin:'0 auto'}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:18}}>
+        <h1 style={{fontSize:22,fontWeight:800,color:'#fff',margin:0}}>Calendar</h1>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <button onClick={()=>setMonth(new Date(yr,mo-1,1))} style={{width:30,height:30,borderRadius:6,border:'1px solid #1a2f4a',background:'#0f2040',color:'#8fa8c8',cursor:'pointer',fontSize:14}}>◀</button>
+          <span style={{fontWeight:700,color:'#fff',minWidth:160,textAlign:'center',fontSize:15}}>{MONTHS[mo]} {yr}</span>
+          <button onClick={()=>setMonth(new Date(yr,mo+1,1))} style={{width:30,height:30,borderRadius:6,border:'1px solid #1a2f4a',background:'#0f2040',color:'#8fa8c8',cursor:'pointer',fontSize:14}}>▶</button>
+        </div>
+      </div>
+      <div style={{background:'#0f2040',border:'1px solid #1a2f4a',borderRadius:12,overflow:'hidden'}}>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',borderBottom:'1px solid #1a2f4a'}}>
+          {DAYS.map(d=><div key={d} style={{padding:'8px 0',textAlign:'center',fontSize:11,fontWeight:700,color:'#4a6a8a',letterSpacing:'.06em'}}>{d}</div>)}
+        </div>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)'}}>
+          {Array.from({length:first}).map((_,i)=><div key={'e'+i} style={{minHeight:90,borderBottom:'1px solid #0f1f35',borderRight:'1px solid #0f1f35'}} />)}
+          {Array.from({length:days}).map((_,i)=>{
+            const d=i+1, dStr=new Date(yr,mo,d).toDateString();
+            const dj=byDate[dStr]?[...byDate[dStr]]:[];
+            const isToday=dStr===todayStr;
+            return (
+              <div key={d} style={{minHeight:90,borderBottom:'1px solid #0f1f35',borderRight:'1px solid #0f1f35',padding:'6px 5px',background:isToday?'#122038':undefined}}>
+                <div style={{width:22,height:22,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:700,marginBottom:4,background:isToday?DR:'transparent',color:isToday?'#fff':'#8fa8c8'}}>{d}</div>
+                {dj.slice(0,2).map(j=>(
+                  <button key={j.id} onClick={()=>onOpen(j.id)} style={{display:'block',width:'100%',textAlign:'left',fontSize:10,padding:'2px 5px',borderRadius:4,marginBottom:2,border:'none',cursor:'pointer',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'#fff',background:['applied','interview','offer'].includes(j.status)?'#065f46':'#7f1d1d',transition:'opacity .12s'}}
+                    onMouseOver={e=>e.currentTarget.style.opacity='.75'}
+                    onMouseOut={e=>e.currentTarget.style.opacity='1'}>
+                    {j.title||'Untitled'}
+                  </button>
+                ))}
+                {dj.length>2 && <div style={{fontSize:10,color:'#4a6a8a'}}>+{dj.length-2} more</div>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{display:'flex',gap:16,marginTop:12,fontSize:11,color:'#4a6a8a',alignItems:'center'}}>
+        <span style={{display:'flex',gap:5,alignItems:'center'}}><span style={{width:10,height:10,borderRadius:2,background:'#7f1d1d',display:'inline-block'}}/>In Progress</span>
+        <span style={{display:'flex',gap:5,alignItems:'center'}}><span style={{width:10,height:10,borderRadius:2,background:'#065f46',display:'inline-block'}}/>Applied / Interview / Offer</span>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   APPLICATIONS LIST
+═══════════════════════════════════════════════════════════ */
+function AppList({ jobs, selId, onSelect, onDelete }) {
+  const [search,  setSearch]  = useState('');
+  const [filterS, setFilterS] = useState('all');
+  const [sortBy,  setSortBy]  = useState('dateAdded');
+
+  let filtered = jobs.filter(j=>{
+    const q=search.toLowerCase();
+    return (!q||j.title.toLowerCase().includes(q)||(j.company||'').toLowerCase().includes(q)||(j.location||'').toLowerCase().includes(q))
+      &&(filterS==='all'||j.status===filterS);
+  });
+  filtered=[...filtered].sort((a,b)=>{
+    if(sortBy==='score')   return computeScore(b)-computeScore(a);
+    if(sortBy==='aiScore') return (b.aiScore||0)-(a.aiScore||0);
+    if(sortBy==='appDate') return new Date(b.applicationDate||0)-new Date(a.applicationDate||0);
+    return new Date(b.dateAdded)-new Date(a.dateAdded);
+  });
+
+  return (
+    <div style={{maxWidth:860}}>
+      <div style={{display:'flex',gap:10,marginBottom:16,flexWrap:'wrap'}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search roles, company, location…"
+          style={{flex:'1 1 200px',padding:'8px 12px',borderRadius:8,border:'1px solid #1a2f4a',background:'#0f2040',color:'#dce8f5',fontSize:13,outline:'none'}} />
+        <select value={filterS} onChange={e=>setFilterS(e.target.value)}
+          style={{padding:'8px 10px',borderRadius:8,border:'1px solid #1a2f4a',background:'#0f2040',color:'#dce8f5',fontSize:13,outline:'none'}}>
+          <option value="all">All Statuses</option>
+          {Object.entries(STATUS).map(([s,{label}])=><option key={s} value={s}>{label}</option>)}
+        </select>
+        <select value={sortBy} onChange={e=>setSortBy(e.target.value)}
+          style={{padding:'8px 10px',borderRadius:8,border:'1px solid #1a2f4a',background:'#0f2040',color:'#dce8f5',fontSize:13,outline:'none'}}>
+          <option value="dateAdded">Sort: Date Added</option>
+          <option value="score">Sort: Opt Score</option>
+          <option value="aiScore">Sort: AI Score</option>
+          <option value="appDate">Sort: App Date</option>
+        </select>
+      </div>
+
+      <div style={{display:'flex',flexDirection:'column',gap:8}}>
+        {filtered.map(j=>{
+          const sc=computeScore(j), isSel=j.id===selId;
+          const {color:stColor}=STATUS[j.status]||{color:'#475569'};
+          return (
+            <div key={j.id} onClick={()=>onSelect(j.id)} style={{background:isSel?'#122038':'#0f2040',border:`1px solid ${isSel?DR:'#1a2f4a'}`,borderRadius:12,padding:'14px 16px',cursor:'pointer',transition:'all .15s'}}
+              onMouseOver={e=>{ if(!isSel) e.currentTarget.style.borderColor='#2a4060'; }}
+              onMouseOut={e=>{  if(!isSel) e.currentTarget.style.borderColor='#1a2f4a'; }}>
+              <div style={{display:'flex',alignItems:'flex-start',gap:12}}>
+                <div style={{flex:1,minWidth:0}}>
+                  <div style={{display:'flex',gap:7,alignItems:'center',marginBottom:5,flexWrap:'wrap'}}>
+                    <span style={{background:stColor+'22',border:`1px solid ${stColor}55`,color:stColor,borderRadius:20,padding:'2px 10px',fontSize:11,fontWeight:700}}>{STATUS[j.status]?.label||j.status}</span>
+                    {j.aiScore>=80 && <span style={{background:'#06472655',border:'1px solid #10b98155',color:'#34d399',borderRadius:20,padding:'2px 10px',fontSize:11,fontWeight:700}}>AI {j.aiScore}/100</span>}
+                  </div>
+                  <div style={{fontWeight:700,color:'#e8f2ff',fontSize:15,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{j.title||<em style={{color:'#4a6a8a'}}>Untitled Role</em>}</div>
+                  <div style={{fontSize:12,color:'#4a6a8a',marginTop:2}}>{j.company}{j.location&&` · ${j.location}`}</div>
+                  {j.payRate && (
+                    <div style={{marginTop:5,display:'inline-flex',alignItems:'center',gap:5,padding:'2px 9px',borderRadius:12,background:'#06472640',border:'1px solid #10b98133'}}>
+                      <span style={{fontSize:11,color:'#34d399',fontWeight:700}}>💵 {j.payRate}</span>
+                    </div>
+                  )}
+                </div>
+                <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:6,flexShrink:0}}>
+                  <div style={{display:'flex',alignItems:'center',gap:7}}>
+                    <div style={{width:64,height:5,borderRadius:3,background:'#1a2f4a',overflow:'hidden'}}>
+                      <div style={{height:'100%',borderRadius:3,width:sc+'%',background:scoreClr(sc),transition:'width .3s'}} />
+                    </div>
+                    <span style={{fontSize:11,fontWeight:700,color:scoreClr(sc),minWidth:30,textAlign:'right'}}>{sc}%</span>
+                  </div>
+                  <span style={{fontSize:11,color:'#4a6a8a'}}>{shortDt(j.dateAdded)}</span>
+                  <button onClick={e=>{e.stopPropagation();onDelete(j.id);}} style={{padding:'2px 6px',borderRadius:4,border:'none',background:'transparent',color:'#4a6a8a',cursor:'pointer',fontSize:11,transition:'color .12s'}}
+                    onMouseOver={e=>e.currentTarget.style.color=DR}
+                    onMouseOut={e=>e.currentTarget.style.color='#4a6a8a'}>Remove</button>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+        {!filtered.length &&
+          <div style={{textAlign:'center',padding:'60px 0',color:'#4a6a8a',fontSize:14}}>
+            {jobs.length===0
+              ? <span>No roles yet — click <strong style={{color:'#8fa8c8'}}>+ Add Role</strong> or <strong style={{color:'#8fa8c8'}}>↓ Import</strong> scraped jobs</span>
+              : 'No roles match — try adjusting filters'}
+          </div>}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   DETAIL PANEL
+═══════════════════════════════════════════════════════════ */
+function DetailPanel({ job, dTab, setDTab, update, duplicate, addNote, delNote, addActivity, settings, onClose }) {
+  const sc=computeScore(job);
+  const TABS=[['listing','Job Listing'],['overview','Overview'],['resume','Resume'],['cover','Cover Letter'],['notes','Notes'],['optimize','Optimize']];
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100%'}}>
+      <div style={{padding:'16px 18px',borderBottom:'1px solid #1a2f4a',flexShrink:0}}>
+        <div style={{display:'flex',alignItems:'flex-start',gap:10,marginBottom:12}}>
+          <div style={{flex:1,minWidth:0}}>
+            <input value={job.title} onChange={e=>update(job.id,{title:e.target.value})} placeholder="Role Title"
+              style={{width:'100%',background:'transparent',border:'none',outline:'none',color:'#fff',fontWeight:800,fontSize:17,padding:0}} />
+            <div style={{display:'flex',gap:6,marginTop:4,flexWrap:'wrap'}}>
+              <input value={job.company} onChange={e=>update(job.id,{company:e.target.value})}
+                style={{background:'transparent',border:'none',outline:'none',color:'#6b8aaa',fontSize:12,padding:0,width:110}} />
+              <span style={{color:'#1a2f4a'}}>·</span>
+              <input value={job.location} onChange={e=>update(job.id,{location:e.target.value})} placeholder="Location"
+                style={{background:'transparent',border:'none',outline:'none',color:'#6b8aaa',fontSize:12,padding:0,flex:1}} />
+            </div>
+          </div>
+          <div style={{display:'flex',gap:6,flexShrink:0}}>
+            <button onClick={()=>duplicate(job)} style={{padding:'4px 10px',borderRadius:6,border:'1px solid #1a2f4a',background:'#0f2040',color:'#8fa8c8',cursor:'pointer',fontSize:12,transition:'all .12s'}}
+              onMouseOver={e=>e.currentTarget.style.borderColor='#4a6a8a'}
+              onMouseOut={e=>e.currentTarget.style.borderColor='#1a2f4a'}>
+              ⧉ Duplicate
+            </button>
+            <button onClick={onClose} style={{width:28,height:28,borderRadius:6,border:'none',background:'transparent',color:'#4a6a8a',cursor:'pointer',fontSize:16,transition:'color .12s'}}
+              onMouseOver={e=>e.currentTarget.style.color='#fff'}
+              onMouseOut={e=>e.currentTarget.style.color='#4a6a8a'}>✕</button>
+          </div>
+        </div>
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <div style={{flex:1,height:5,borderRadius:3,background:'#1a2f4a',overflow:'hidden'}}>
+            <div style={{height:'100%',borderRadius:3,background:scoreClr(sc),width:sc+'%',transition:'width .4s'}} />
+          </div>
+          <span style={{fontSize:11,fontWeight:700,color:scoreClr(sc),minWidth:80,textAlign:'right'}}>{sc}% optimized</span>
+        </div>
+      </div>
+
+      <div style={{display:'flex',borderBottom:'1px solid #1a2f4a',flexShrink:0,overflowX:'auto'}}>
+        {TABS.map(([id,lbl])=>(
+          <button key={id} onClick={()=>setDTab(id)} style={{
+            flexShrink:0,padding:'9px 10px',border:'none',
+            borderBottom:`2px solid ${dTab===id?DR:'transparent'}`,
+            background:'transparent',cursor:'pointer',fontSize:11,fontWeight:700,
+            color:dTab===id?'#fff':'#4a6a8a',letterSpacing:'.02em',transition:'color .12s',whiteSpace:'nowrap'}}>
+            {lbl}
+          </button>
+        ))}
+      </div>
+
+      <div style={{flex:1,overflowY:'auto',padding:'18px'}}>
+        {dTab==='listing'  && <JobListingTab job={job} update={update} />}
+        {dTab==='overview' && <OverviewTab   job={job} update={update} addActivity={addActivity} settings={settings} />}
+        {dTab==='resume'   && <EditorTab     value={job.resume}      onChange={v=>update(job.id,{resume:v})}      placeholder="Paste or write your tailored resume for this specific role…" />}
+        {dTab==='cover'    && <EditorTab     value={job.coverLetter} onChange={v=>update(job.id,{coverLetter:v})} placeholder="Write a tailored cover letter for this role…" />}
+        {dTab==='notes'    && <NotesTab      job={job} addNote={addNote} delNote={delNote} />}
+        {dTab==='optimize' && <OptimizeTab   job={job} update={update} score={sc} />}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   JOB LISTING TAB
+═══════════════════════════════════════════════════════════ */
+function JobListingTab({ job, update }) {
+  const F=({label,fieldKey,placeholder,multiline=false,rows=3,green=false})=>(
+    <div>
+      <label style={{fontSize:11,color:'#4a6a8a',display:'block',marginBottom:5,fontWeight:700,letterSpacing:'.06em'}}>{label}</label>
+      {multiline
+        ? <textarea value={job[fieldKey]||''} rows={rows} onChange={e=>update(job.id,{[fieldKey]:e.target.value})} placeholder={placeholder}
+            style={{width:'100%',padding:'11px 13px',borderRadius:9,border:'1px solid #1a2f4a',background:'#071422',color:'#c8dcf0',fontSize:13,lineHeight:1.6,resize:'vertical',outline:'none',fontFamily:'inherit'}} />
+        : <input value={job[fieldKey]||''} onChange={e=>update(job.id,{[fieldKey]:e.target.value})} placeholder={placeholder}
+            style={{width:'100%',padding:'9px 13px',borderRadius:9,border:'1px solid #1a2f4a',background:'#071422',color:green?'#34d399':'#dce8f5',fontSize:13,fontWeight:green?700:400,outline:'none'}} />}
+    </div>
+  );
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      {/* Apply banner */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',background:'#071422',border:'1px solid #1a2f4a',borderRadius:10,padding:'12px 16px',gap:12,flexWrap:'wrap'}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:11,color:'#4a6a8a',fontWeight:700,letterSpacing:'.06em',marginBottom:3}}>APPLICATION LINK</div>
+          <input value={job.url||''} onChange={e=>update(job.id,{url:e.target.value})} placeholder="Paste the job posting URL here…"
+            style={{width:'100%',background:'transparent',border:'none',outline:'none',color:'#60a5fa',fontSize:13,padding:0}} />
+        </div>
+        {job.url && (
+          <a href={job.url} target="_blank" rel="noreferrer" style={{display:'inline-flex',alignItems:'center',gap:6,padding:'8px 18px',borderRadius:8,background:DR,color:'#fff',fontWeight:700,fontSize:13,textDecoration:'none',flexShrink:0,transition:'opacity .12s'}}
+            onMouseOver={e=>e.currentTarget.style.opacity='.82'}
+            onMouseOut={e=>e.currentTarget.style.opacity='1'}>
+            Apply Now ↗
+          </a>
+        )}
+      </div>
+
+      {/* Meta row */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
+        <F label="PAY RATE / SALARY" fieldKey="payRate" placeholder="e.g. $95,000–$120,000" green />
+        <div>
+          <label style={{fontSize:11,color:'#4a6a8a',display:'block',marginBottom:5,fontWeight:700,letterSpacing:'.06em'}}>JOB TYPE</label>
+          <select value={job.jobType||''} onChange={e=>update(job.id,{jobType:e.target.value})}
+            style={{width:'100%',padding:'9px 13px',borderRadius:9,border:'1px solid #1a2f4a',background:'#071422',color:'#dce8f5',fontSize:13,outline:'none'}}>
+            <option value="">Select…</option>
+            <option>Full-Time</option><option>Part-Time</option><option>Contract</option><option>Internship</option>
+          </select>
+        </div>
+        <F label="LOCATION" fieldKey="location" placeholder="Remote / Atlanta, GA" />
+      </div>
+
+      {job.payRate && (
+        <div style={{display:'inline-flex',alignItems:'center',gap:8,padding:'6px 14px',borderRadius:20,background:'#06472655',border:'1px solid #10b98144'}}>
+          <span style={{fontSize:12,color:'#34d399',fontWeight:700}}>💵 {job.payRate}</span>
+          {job.jobType && <span style={{fontSize:11,color:'#4a6a8a'}}>· {job.jobType}</span>}
+        </div>
+      )}
+
+      <F label="JOB DESCRIPTION / OVERVIEW"    fieldKey="jobDescription"  multiline rows={6} placeholder="Paste the full job description or overview from the posting…" />
+      <F label="RESPONSIBILITIES"               fieldKey="responsibilities" multiline rows={8} placeholder="Paste the key responsibilities listed in the posting…" />
+      <F label="REQUIREMENTS & QUALIFICATIONS"  fieldKey="requirements"    multiline rows={5} placeholder="Required skills, education, years of experience, certifications…" />
+
+      <div style={{display:'flex',gap:16,fontSize:11,color:'#2a4060'}}>
+        {[['Description',job.jobDescription],['Responsibilities',job.responsibilities],['Requirements',job.requirements]]
+          .filter(([,v])=>v).map(([lbl,v])=><span key={lbl}>{lbl}: {wc(v)} words</span>)}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   OVERVIEW TAB  (with live Ollama AI generation)
+═══════════════════════════════════════════════════════════ */
+function OverviewTab({ job, update, addActivity, settings }) {
+  const obj = job.deltaObjective||{};
+  const [genKeys, setGenKeys] = useState(new Set());
+  const [genError, setGenError] = useState('');
+
+  const endpoint = settings?.ollamaEndpoint || 'http://localhost:11434/api/generate';
+  const model    = settings?.ollamaModel    || 'llama3';
+
+  const hasDesc = (job.jobDescription||job.responsibilities||'').trim().length > 80;
+
+  // Auto-generate all 4 fields when description is pasted and all fields are blank
+  useEffect(()=>{
+    if (!hasDesc) return;
+    const allEmpty = ['income','flightHours','seniority','foCredentials'].every(k=>!(obj[k]||'').trim());
+    if (allEmpty) generateAll();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[job.jobDescription, job.responsibilities]);
+
+  const generateField = async (field) => {
+    if (genKeys.has(field)) return;
+    setGenError('');
+    setGenKeys(p=>new Set([...p,field]));
+    try {
+      const text = await callOllama(endpoint, model, FIT_SYSTEM, fitPrompt(field, job));
+      update(job.id, { deltaObjective:{...obj,[field]:text} });
+    } catch(e) {
+      setGenError(`Ollama error: ${e.message}. Make sure Ollama is running on ${endpoint}`);
+    } finally {
+      setGenKeys(p=>{ const n=new Set(p); n.delete(field); return n; });
+    }
+  };
+
+  const generateAll = async () => {
+    const fields=['income','flightHours','seniority','foCredentials'];
+    setGenError('');
+    setGenKeys(new Set(fields));
+    try {
+      const results = await Promise.all(fields.map(f=>callOllama(endpoint,model,FIT_SYSTEM,fitPrompt(f,job)).catch(()=>null)));
+      const patch={};
+      fields.forEach((f,i)=>{ if(results[i]) patch[f]=results[i]; });
+      update(job.id,{deltaObjective:{...obj,...patch}});
+    } catch(e) {
+      setGenError(`Ollama unavailable. Is it running at ${endpoint}?`);
+    } finally {
+      setGenKeys(new Set());
+    }
+  };
+
+  const OBJ_FIELDS=[
+    {key:'income',       icon:'💰',label:'Income & Financial Runway'},
+    {key:'flightHours',  icon:'✈️', label:'Flight Hours & Aviation Expertise'},
+    {key:'seniority',    icon:'📊',label:'Seniority & Network Building'},
+    {key:'foCredentials',icon:'🎖️', label:'Delta FO Resume & Credentials'},
+  ];
+
+  const anyGenerating = genKeys.size > 0;
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      {/* Status + date */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+        <div>
+          <label style={{fontSize:11,color:'#4a6a8a',display:'block',marginBottom:5,fontWeight:600}}>STATUS</label>
+          <select value={job.status} onChange={e=>{ update(job.id,{status:e.target.value}); addActivity(job.id,`Status → ${STATUS[e.target.value]?.label}`); }}
+            style={{width:'100%',padding:'7px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#071422',color:'#dce8f5',fontSize:13,outline:'none'}}>
+            {Object.entries(STATUS).map(([s,{label}])=><option key={s} value={s}>{label}</option>)}
+          </select>
+        </div>
+        <div>
+          <label style={{fontSize:11,color:'#4a6a8a',display:'block',marginBottom:5,fontWeight:600}}>APPLICATION DATE</label>
+          <input type="date" value={job.applicationDate?job.applicationDate.slice(0,10):''}
+            onChange={e=>update(job.id,{applicationDate:e.target.value})}
+            style={{width:'100%',padding:'7px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#071422',color:'#dce8f5',fontSize:13,outline:'none'}} />
+        </div>
+      </div>
+
+      {/* URL quick-open */}
+      {job.url && (
+        <a href={job.url} target="_blank" rel="noreferrer" style={{display:'inline-flex',alignItems:'center',gap:6,padding:'7px 14px',borderRadius:8,background:DR,color:'#fff',fontWeight:700,fontSize:13,textDecoration:'none',alignSelf:'flex-start'}}>
+          Apply Now ↗
+        </a>
+      )}
+
+      {/* AI score from scraper */}
+      {job.aiScore>0 && (
+        <div style={{background:'#071422',border:'1px solid #1a2f4a',borderRadius:10,padding:'12px 14px'}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:5}}>
+            <span style={{fontSize:11,fontWeight:700,color:'#4a6a8a',letterSpacing:'.06em'}}>SCRAPER AI MATCH SCORE</span>
+            <span style={{fontWeight:800,color:'#34d399',fontSize:16}}>{job.aiScore}/100</span>
+          </div>
+          <p style={{fontSize:12,color:'#6b8aaa',margin:0,lineHeight:1.5}}>{job.aiReasoning}</p>
+        </div>
+      )}
+
+      {/* Delta Fit Analysis */}
+      <div>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}}>
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            <span style={{color:DR,fontWeight:900,fontSize:16}}>Δ</span>
+            <span style={{fontWeight:700,color:'#e8f2ff',fontSize:13}}>Delta Career Fit Analysis</span>
+          </div>
+          <button onClick={generateAll} disabled={anyGenerating} style={{
+            display:'flex',alignItems:'center',gap:6,
+            padding:'5px 14px',borderRadius:7,border:'none',cursor:anyGenerating?'wait':'pointer',
+            background:anyGenerating?'#1a2f4a':DR,color:'#fff',fontSize:12,fontWeight:700,
+            transition:'opacity .12s',opacity:anyGenerating?.7:1}}>
+            {anyGenerating ? <><span className="spin">◌</span> Generating…</> : '✦ Generate All'}
+          </button>
+        </div>
+
+        {!hasDesc && (
+          <div style={{background:'#071422',border:'1px solid #f59e0b44',borderRadius:9,padding:'10px 14px',marginBottom:10,fontSize:12,color:'#f59e0b'}}>
+            ⚠️ Paste a job description in the <strong>Job Listing</strong> tab first — AI generation uses it to write specific, accurate analysis.
+          </div>
+        )}
+
+        {genError && (
+          <div style={{background:'#071422',border:'1px solid #dc262644',borderRadius:9,padding:'10px 14px',marginBottom:10,fontSize:12,color:'#f87171'}}>
+            {genError}
+          </div>
+        )}
+
+        <div style={{display:'flex',flexDirection:'column',gap:10}}>
+          {OBJ_FIELDS.map(({key,icon,label})=>{
+            const loading=genKeys.has(key);
+            return (
+              <div key={key} style={{border:'1px solid #1a2f4a',borderRadius:10,overflow:'hidden'}}>
+                <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'9px 13px',background:'#0f2040',borderBottom:'1px solid #1a2f4a'}}>
+                  <span style={{fontSize:12,fontWeight:700,color:'#c8dcf0'}}>{icon} {label}</span>
+                  <button onClick={()=>generateField(key)} disabled={loading} style={{
+                    display:'flex',alignItems:'center',gap:5,
+                    padding:'3px 10px',borderRadius:5,border:'none',cursor:loading?'wait':'pointer',
+                    background:loading?'#1a2f4a':DR,color:'#fff',fontSize:11,fontWeight:700,transition:'opacity .12s'}}>
+                    {loading ? <><span className="spin">◌</span> Generating</> : '✦ AI Generate'}
+                  </button>
+                </div>
+                <textarea value={obj[key]||''} rows={3}
+                  onChange={e=>update(job.id,{deltaObjective:{...obj,[key]:e.target.value}})}
+                  placeholder={loading?'Generating with Ollama…':`Why this role helps your ${label.toLowerCase()}…`}
+                  style={{width:'100%',padding:'10px 13px',background:'#071422',border:'none',outline:'none',
+                    color:loading?'#4a6a8a':'#c8dcf0',fontSize:12,resize:'vertical',lineHeight:1.55,fontFamily:'inherit'}} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Activity log */}
+      {(job.activities||[]).length>0 && (
+        <div>
+          <div style={{fontSize:11,fontWeight:700,color:'#4a6a8a',letterSpacing:'.06em',marginBottom:8}}>ACTIVITY LOG</div>
+          {[...job.activities].reverse().map(a=>(
+            <div key={a.id} style={{display:'flex',gap:10,fontSize:11,marginBottom:4}}>
+              <span style={{color:'#2a4060',flexShrink:0}}>{shortDt(a.date)}</span>
+              <span style={{color:'#6b8aaa'}}>{a.desc}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   EDITOR TAB
+═══════════════════════════════════════════════════════════ */
+function EditorTab({ value, onChange, placeholder }) {
+  const [copied, setCopied]=useState(false);
+  const count=wc(value);
+  const copy=()=>navigator.clipboard.writeText(value||'').then(()=>{ setCopied(true); setTimeout(()=>setCopied(false),1500); });
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100%',gap:10}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+        <span style={{fontSize:11,color:'#4a6a8a'}}>{count} word{count!==1?'s':''}</span>
+        <button onClick={copy} style={{padding:'4px 12px',borderRadius:6,border:'1px solid #1a2f4a',background:copied?'#065f46':'#0f2040',color:copied?'#34d399':'#8fa8c8',fontSize:12,cursor:'pointer',transition:'all .15s'}}>
+          {copied?'✓ Copied':'Copy'}
+        </button>
+      </div>
+      <textarea value={value||''} onChange={e=>onChange(e.target.value)} placeholder={placeholder}
+        style={{flex:1,width:'100%',padding:'14px',borderRadius:9,border:'1px solid #1a2f4a',background:'#071422',color:'#c8dcf0',fontSize:12.5,lineHeight:1.65,resize:'none',outline:'none',fontFamily:'ui-monospace,monospace',minHeight:440}} />
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   NOTES TAB
+═══════════════════════════════════════════════════════════ */
+function NotesTab({ job, addNote, delNote }) {
+  const [draft, setDraft]=useState('');
+  const submit=()=>{ if(draft.trim()){ addNote(job.id,draft.trim()); setDraft(''); } };
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      <div style={{display:'flex',flexDirection:'column',gap:8}}>
+        <textarea value={draft} onChange={e=>setDraft(e.target.value)} rows={4}
+          placeholder="Add a note — research insights, contacts, interview prep, follow-up tasks…"
+          style={{width:'100%',padding:'12px',borderRadius:9,border:'1px solid #1a2f4a',background:'#071422',color:'#c8dcf0',fontSize:13,lineHeight:1.55,resize:'none',outline:'none',fontFamily:'inherit'}}
+          onKeyDown={e=>{ if(e.key==='Enter'&&(e.metaKey||e.ctrlKey)) submit(); }} />
+        <div style={{display:'flex',alignItems:'center',gap:10}}>
+          <button onClick={submit} style={{padding:'7px 18px',borderRadius:7,border:'none',cursor:'pointer',background:DR,color:'#fff',fontWeight:700,fontSize:13}}
+            onMouseOver={e=>e.currentTarget.style.opacity='.8'} onMouseOut={e=>e.currentTarget.style.opacity='1'}>Save Note</button>
+          <span style={{fontSize:11,color:'#4a6a8a'}}>⌘↵ / Ctrl↵ to save</span>
+        </div>
+      </div>
+      <div style={{display:'flex',flexDirection:'column',gap:10}}>
+        {[...(job.notes||[])].reverse().map(n=>(
+          <div key={n.id} style={{background:'#071422',border:'1px solid #1a2f4a',borderRadius:9,padding:'12px 14px'}}>
+            <div style={{display:'flex',alignItems:'flex-start',gap:10}}>
+              <p style={{flex:1,margin:0,fontSize:13,color:'#c8dcf0',whiteSpace:'pre-wrap',lineHeight:1.55}}>{n.content}</p>
+              <button onClick={()=>delNote(job.id,n.id)} style={{background:'transparent',border:'none',cursor:'pointer',color:'#2a4060',fontSize:14,padding:'0 2px',flexShrink:0,transition:'color .12s'}}
+                onMouseOver={e=>e.currentTarget.style.color=DR} onMouseOut={e=>e.currentTarget.style.color='#2a4060'}>✕</button>
+            </div>
+            <div style={{fontSize:11,color:'#2a4060',marginTop:8}}>{dateStr(n.date)}</div>
+          </div>
+        ))}
+        {!(job.notes||[]).length && <div style={{textAlign:'center',padding:'32px 0',color:'#2a4060',fontSize:13}}>No notes yet</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   OPTIMIZE TAB
+═══════════════════════════════════════════════════════════ */
+function OptimizeTab({ job, update, score }) {
+  const o=job.deltaObjective||{};
+  const checks=[
+    {label:'Job description pasted',                done:(job.jobDescription||'').trim().length>50,      pts:10},
+    {label:'Resume tailored to this role',          done:(job.resume||'').trim().length>50,              pts:20},
+    {label:'Cover letter written',                  done:(job.coverLetter||'').trim().length>50,         pts:20},
+    {label:'Income / financial runway documented',  done:(o.income||'').trim().length>20,                pts:5 },
+    {label:'Flight hours & expertise filled',       done:(o.flightHours||'').trim().length>20,           pts:5 },
+    {label:'Seniority & network strategy written',  done:(o.seniority||'').trim().length>20,             pts:5 },
+    {label:'FO credential alignment documented',    done:(o.foCredentials||'').trim().length>20,         pts:5 },
+    {label:'At least one research note added',      done:(job.notes||[]).length>0,                       pts:10},
+    {label:'Status progressed beyond "New"',        done:job.status!=='new',                             pts:5 },
+    {label:'Application date set',                  done:!!job.applicationDate,                          pts:5 },
+    {label:'Keywords / JD highlights captured',     done:(job.keywords||'').trim().length>10,            pts:10},
+  ];
+  const c=scoreClr(score), circ=2*Math.PI*26, dash=(score/100)*circ;
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      <div style={{background:'#071422',border:'1px solid #1a2f4a',borderRadius:12,padding:'16px 18px',display:'flex',alignItems:'center',gap:18}}>
+        <div style={{position:'relative',flexShrink:0}}>
+          <svg width="68" height="68" style={{transform:'rotate(-90deg)'}}>
+            <circle cx="34" cy="34" r="26" fill="none" stroke="#1a2f4a" strokeWidth="6" />
+            <circle cx="34" cy="34" r="26" fill="none" stroke={c} strokeWidth="6"
+              strokeDasharray={`${dash} ${circ}`} strokeLinecap="round" style={{transition:'stroke-dasharray .5s'}} />
+          </svg>
+          <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
+            <span style={{fontWeight:800,fontSize:14,color:c}}>{score}%</span>
+          </div>
+        </div>
+        <div>
+          <div style={{fontWeight:700,color:'#e8f2ff',fontSize:15}}>{score>=70?'✅ Ready to Submit':score>=40?'⚠️ Needs Work':'🔴 Early Stage'}</div>
+          <div style={{fontSize:12,color:'#4a6a8a',marginTop:3,lineHeight:1.4}}>{score>=70?'Application is well-optimized.':score+' / 100 — complete items below.'}</div>
+        </div>
+      </div>
+      <div style={{display:'flex',flexDirection:'column',gap:6}}>
+        {checks.map((ck,i)=>(
+          <div key={i} style={{display:'flex',alignItems:'center',gap:10,borderRadius:8,padding:'9px 13px',background:ck.done?'#04301899':'#071422',border:`1px solid ${ck.done?'#065f4655':'#1a2f4a'}`}}>
+            <div style={{width:20,height:20,borderRadius:'50%',flexShrink:0,display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,background:ck.done?'#10b981':'#1a2f4a',color:ck.done?'#fff':'#4a6a8a'}}>{ck.done?'✓':''}</div>
+            <span style={{flex:1,fontSize:13,color:ck.done?'#6ee7b7':'#8fa8c8'}}>{ck.label}</span>
+            <span style={{fontSize:11,fontWeight:700,color:ck.done?'#10b981':'#2a4060'}}>+{ck.pts}pts</span>
+          </div>
+        ))}
+      </div>
+      <div>
+        <label style={{fontSize:11,color:'#4a6a8a',display:'block',marginBottom:7,fontWeight:600,letterSpacing:'.06em'}}>KEYWORDS & JD HIGHLIGHTS</label>
+        <textarea value={job.keywords||''} rows={3} onChange={e=>update(job.id,{keywords:e.target.value})}
+          placeholder="Key skills, requirements, and phrases to mirror in resume and cover letter…"
+          style={{width:'100%',padding:'11px 13px',borderRadius:9,border:'1px solid #1a2f4a',background:'#071422',color:'#c8dcf0',fontSize:12.5,lineHeight:1.55,resize:'none',outline:'none',fontFamily:'inherit'}} />
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SETTINGS VIEW
+═══════════════════════════════════════════════════════════ */
+function SettingsView({ settings, setSettings }) {
+  const upd = patch => setSettings(s=>({...s,...patch}));
+  const updScraper = patch => setSettings(s=>({...s,scraperConfig:undefined,...patch}));
+
+  const addSource = () => setSettings(s=>({...s,
+    jobSources:[...s.jobSources,{id:uid(),name:'',url:'',type:'public',username:'',notes:''}]}));
+
+  const updateSource = (id,patch) => setSettings(s=>({...s,
+    jobSources:s.jobSources.map(src=>src.id===id?{...src,...patch}:src)}));
+
+  const removeSource = id => setSettings(s=>({...s,jobSources:s.jobSources.filter(src=>src.id!==id)}));
+
+  const exportConfig = () => {
+    const cfg={
+      APIFY_API_TOKEN:    settings.apifyToken,
+      WEBHOOK_URL:        settings.webhookUrl,
+      OLLAMA_MODEL:       settings.ollamaModel,
+      OLLAMA_ENDPOINT:    settings.ollamaEndpoint,
+      SCORE_THRESHOLD:    settings.scoreThreshold,
+      SEARCH_QUERIES:     settings.searchQueries,
+      JOB_SOURCES:        settings.jobSources.map(s=>({name:s.name,url:s.url,type:s.type})),
+    };
+    const blob=new Blob([JSON.stringify(cfg,null,2)],{type:'application/json'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
+    a.download='delta_agent_config.json'; a.click();
+  };
+
+  const Section=({title,children})=>(
+    <div style={{background:'#0f2040',border:'1px solid #1a2f4a',borderRadius:12,padding:'20px',marginBottom:16}}>
+      <h3 style={{margin:'0 0 16px',fontSize:13,fontWeight:700,color:'#fff',letterSpacing:'.03em',borderBottom:'1px solid #1a2f4a',paddingBottom:10}}>{title}</h3>
+      {children}
+    </div>
+  );
+
+  const Input=({label,value,onChange,placeholder,type='text'})=>(
+    <div style={{marginBottom:12}}>
+      <label style={{fontSize:11,color:'#4a6a8a',display:'block',marginBottom:5,fontWeight:700,letterSpacing:'.06em'}}>{label}</label>
+      <input type={type} value={value||''} onChange={onChange} placeholder={placeholder}
+        style={{width:'100%',padding:'9px 12px',borderRadius:8,border:'1px solid #1a2f4a',background:'#071422',color:'#dce8f5',fontSize:13,outline:'none'}} />
+    </div>
+  );
+
+  const updateQuery = (i,val) => {
+    const q=[...settings.searchQueries]; q[i]=val;
+    upd({searchQueries:q});
+  };
+  const addQuery    = () => upd({searchQueries:[...settings.searchQueries,'']});
+  const removeQuery = i  => upd({searchQueries:settings.searchQueries.filter((_,j)=>j!==i)});
+
+  return (
+    <div style={{maxWidth:800,margin:'0 auto'}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:24}}>
+        <h1 style={{fontSize:22,fontWeight:800,color:'#fff',margin:0}}>Settings</h1>
+        <button onClick={exportConfig} style={{padding:'8px 18px',borderRadius:8,border:'none',cursor:'pointer',background:DR,color:'#fff',fontWeight:700,fontSize:13}}>
+          ↓ Export Config for Scraper
+        </button>
+      </div>
+
+      {/* Scraper / Ollama */}
+      <Section title="⚙️ Scraper & AI Configuration">
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+          <Input label="APIFY API TOKEN" value={settings.apifyToken} placeholder="Your Apify token"
+            onChange={e=>upd({apifyToken:e.target.value})} />
+          <Input label="SCORE THRESHOLD (0–100)" value={settings.scoreThreshold} type="number"
+            placeholder="80" onChange={e=>upd({scoreThreshold:Number(e.target.value)})} />
+          <Input label="OLLAMA ENDPOINT" value={settings.ollamaEndpoint}
+            placeholder="http://localhost:11434/api/generate"
+            onChange={e=>upd({ollamaEndpoint:e.target.value})} />
+          <Input label="OLLAMA MODEL" value={settings.ollamaModel}
+            placeholder="llama3" onChange={e=>upd({ollamaModel:e.target.value})} />
+          <div style={{gridColumn:'1/-1'}}>
+            <Input label="DISCORD / SLACK WEBHOOK URL" value={settings.webhookUrl}
+              placeholder="https://discord.com/api/webhooks/…"
+              onChange={e=>upd({webhookUrl:e.target.value})} />
+          </div>
+        </div>
+        <div style={{marginTop:4,padding:'10px 14px',borderRadius:8,background:'#071422',border:'1px solid #1a2f4a',fontSize:12,color:'#6b8aaa',lineHeight:1.5}}>
+          💡 Ollama is called <strong style={{color:'#c8dcf0'}}>directly from this browser tab</strong> for the Career Fit Analysis — no server needed. Make sure <code style={{color:'#60a5fa'}}>ollama serve</code> is running on your Mac.
+        </div>
+      </Section>
+
+      {/* Search Queries */}
+      <Section title="🔍 Scraper Search Queries">
+        <div style={{display:'flex',flexDirection:'column',gap:8,marginBottom:10}}>
+          {settings.searchQueries.map((q,i)=>(
+            <div key={i} style={{display:'flex',gap:8,alignItems:'center'}}>
+              <input value={q} onChange={e=>updateQuery(i,e.target.value)} placeholder={`Search query ${i+1}`}
+                style={{flex:1,padding:'8px 12px',borderRadius:8,border:'1px solid #1a2f4a',background:'#071422',color:'#dce8f5',fontSize:13,outline:'none'}} />
+              <button onClick={()=>removeQuery(i)} style={{width:30,height:30,borderRadius:6,border:'1px solid #1a2f4a',background:'transparent',color:'#4a6a8a',cursor:'pointer',fontSize:16,transition:'color .12s'}}
+                onMouseOver={e=>e.currentTarget.style.color=DR}
+                onMouseOut={e=>e.currentTarget.style.color='#4a6a8a'}>✕</button>
+            </div>
+          ))}
+        </div>
+        <button onClick={addQuery} style={{padding:'7px 16px',borderRadius:7,border:'1px dashed #1a2f4a',background:'transparent',color:'#4a6a8a',cursor:'pointer',fontSize:13,fontWeight:600,transition:'all .12s'}}
+          onMouseOver={e=>{ e.currentTarget.style.borderColor='#4a6a8a'; e.currentTarget.style.color='#8fa8c8'; }}
+          onMouseOut={e=>{ e.currentTarget.style.borderColor='#1a2f4a'; e.currentTarget.style.color='#4a6a8a'; }}>
+          + Add Query
+        </button>
+      </Section>
+
+      {/* Job Sources */}
+      <Section title="📋 Job Sources & Membership Sites">
+        <p style={{fontSize:12,color:'#4a6a8a',margin:'0 0 14px',lineHeight:1.5}}>
+          Track all sources where Delta-aligned jobs are posted. Public sources are scraped automatically. Membership sites require manual login — store your username here and access them via the URL link.
+        </p>
+        <div style={{display:'flex',flexDirection:'column',gap:10,marginBottom:12}}>
+          {settings.jobSources.map(src=>(
+            <div key={src.id} style={{background:'#071422',border:'1px solid #1a2f4a',borderRadius:10,padding:'14px'}}>
+              <div style={{display:'flex',gap:8,marginBottom:10,alignItems:'flex-start'}}>
+                <div style={{flex:1}}>
+                  <input value={src.name} onChange={e=>updateSource(src.id,{name:e.target.value})} placeholder="Source name (e.g. Delta Careers)"
+                    style={{width:'100%',padding:'7px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#0b1a2e',color:'#dce8f5',fontSize:13,fontWeight:600,outline:'none',marginBottom:7}} />
+                  <input value={src.url} onChange={e=>updateSource(src.id,{url:e.target.value})} placeholder="https://…"
+                    style={{width:'100%',padding:'7px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#0b1a2e',color:'#60a5fa',fontSize:12,outline:'none'}} />
+                </div>
+                <div style={{display:'flex',flexDirection:'column',gap:6,flexShrink:0,alignItems:'flex-end'}}>
+                  <select value={src.type} onChange={e=>updateSource(src.id,{type:e.target.value})}
+                    style={{padding:'6px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#0b1a2e',color:src.type==='membership'?'#fbbf24':'#34d399',fontSize:11,fontWeight:700,outline:'none'}}>
+                    <option value="public">Public</option>
+                    <option value="membership">Membership</option>
+                  </select>
+                  {src.url && <a href={src.url} target="_blank" rel="noreferrer" style={{fontSize:11,color:'#4a6a8a',textDecoration:'none',padding:'4px 8px',border:'1px solid #1a2f4a',borderRadius:5}}>Open ↗</a>}
+                  <button onClick={()=>removeSource(src.id)} style={{fontSize:11,color:'#4a6a8a',background:'transparent',border:'none',cursor:'pointer',padding:'4px 0',transition:'color .12s'}}
+                    onMouseOver={e=>e.currentTarget.style.color=DR}
+                    onMouseOut={e=>e.currentTarget.style.color='#4a6a8a'}>Remove</button>
+                </div>
+              </div>
+              {src.type==='membership' && (
+                <div style={{display:'grid',gridTemplateColumns:'1fr 2fr',gap:8}}>
+                  <input value={src.username||''} onChange={e=>updateSource(src.id,{username:e.target.value})} placeholder="Username / email"
+                    style={{padding:'6px 10px',borderRadius:7,border:'1px solid #f59e0b44',background:'#1a1000',color:'#fbbf24',fontSize:12,outline:'none'}} />
+                  <input value={src.notes||''} onChange={e=>updateSource(src.id,{notes:e.target.value})} placeholder="Notes (e.g. Requires paid membership, renewal date…)"
+                    style={{padding:'6px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#0b1a2e',color:'#8fa8c8',fontSize:12,outline:'none'}} />
+                </div>
+              )}
+              {src.type!=='membership' && src.notes!==undefined && (
+                <input value={src.notes||''} onChange={e=>updateSource(src.id,{notes:e.target.value})} placeholder="Notes…"
+                  style={{width:'100%',padding:'6px 10px',borderRadius:7,border:'1px solid #1a2f4a',background:'#0b1a2e',color:'#6b8aaa',fontSize:12,outline:'none'}} />
+              )}
+            </div>
+          ))}
+        </div>
+        <button onClick={addSource} style={{padding:'8px 18px',borderRadius:7,border:'1px dashed #1a2f4a',background:'transparent',color:'#4a6a8a',cursor:'pointer',fontSize:13,fontWeight:600,transition:'all .12s'}}
+          onMouseOver={e=>{ e.currentTarget.style.borderColor='#4a6a8a'; e.currentTarget.style.color='#8fa8c8'; }}
+          onMouseOut={e=>{ e.currentTarget.style.borderColor='#1a2f4a'; e.currentTarget.style.color='#4a6a8a'; }}>
+          + Add Job Source
+        </button>
+
+        <div style={{marginTop:16,padding:'12px 14px',borderRadius:8,background:'#071422',border:'1px solid #fbbf2444',fontSize:12,color:'#fbbf24',lineHeight:1.5}}>
+          🔐 <strong>Membership site passwords</strong> are not stored here. To scrape login-protected sites, use an Apify actor that supports session cookies or authenticate manually and export results as JSON, then import them with the ↓ Import button above.
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+/* ─── mount ──────────────────────────────────────────────── */
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
